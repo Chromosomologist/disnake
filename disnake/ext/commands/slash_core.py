@@ -17,6 +17,8 @@ from typing import (
     Union,
 )
 
+from typing_extensions import TypeGuard
+
 from disnake import utils
 from disnake.app_commands import Option, SlashCommand
 from disnake.enums import OptionType
@@ -33,6 +35,15 @@ if TYPE_CHECKING:
     from disnake.i18n import LocalizedOptional
 
     from .base_core import CommandCallback
+    from .cog import Cog
+
+    _AutocompleteCallback = Callable[[ApplicationCommandInteraction, str], Optional[Choices]]
+    _CogAutocompleteCallback = Callable[
+        [Cog, ApplicationCommandInteraction, str], Optional[Choices]
+    ]
+    _AnyAutocompleteCallback = Union[_CogAutocompleteCallback, _AutocompleteCallback]
+
+    _AutocompleteCallbackT = TypeVar("_AutocompleteCallbackT", bound=_AnyAutocompleteCallback)
 
 MISSING = utils.MISSING
 
@@ -44,7 +55,7 @@ SlashCommandT = TypeVar("SlashCommandT", bound="InvokableSlashCommand")
 
 def _autocomplete(
     self: Union[SubCommand, InvokableSlashCommand], option_name: str
-) -> Callable[[Callable], Callable]:
+) -> Callable[[_AutocompleteCallbackT], _AutocompleteCallbackT]:
     for option in self.body.options:
         if option.name == option_name:
             option.autocomplete = True
@@ -52,12 +63,24 @@ def _autocomplete(
     else:  # nobreak
         raise ValueError(f"Option '{option_name}' doesn't exist in '{self.qualified_name}'")
 
-    def decorator(func: Callable) -> Callable:
-        classify_autocompleter(func)
-        self.autocompleters[option_name] = func
-        return func
+    def decorator(func: _AutocompleteCallbackT) -> _AutocompleteCallbackT:
+        return _register_autocompleter(self, option_name, func)
 
     return decorator
+
+
+def _register_autocompleter(
+    self: Union[SubCommand, InvokableSlashCommand],
+    option_name: str,
+    func: _AutocompleteCallbackT,
+) -> _AutocompleteCallbackT:
+    classify_autocompleter(func)
+    self.autocompleters[option_name] = func
+    return func
+
+
+def _requires_cog_param(autocomp: _AnyAutocompleteCallback) -> TypeGuard[_CogAutocompleteCallback]:
+    return hasattr(autocomp, "__has_cog_param__")
 
 
 async def _call_autocompleter(
@@ -72,25 +95,21 @@ async def _call_autocompleter(
     if not callable(autocomp):
         return autocomp
 
-    try:
-        requires_cog_param = autocomp.__has_cog_param__
-    except AttributeError:
-        requires_cog_param = False
-
     cog = self.root_parent.cog if isinstance(self, SubCommand) else self.cog
     filled = inter.filled_options
     del filled[inter.data.focused_option.name]
 
+    requires_cog_param = _requires_cog_param(autocomp)
     try:
-        if requires_cog_param:
+        if _requires_cog_param(autocomp) and cog:
             choices = autocomp(cog, inter, user_input, **filled)
         else:
-            choices = autocomp(inter, user_input, **filled)
+            choices = autocomp(inter, user_input, **filled)  # type: ignore
     except TypeError:
-        if requires_cog_param:
+        if requires_cog_param and cog:
             choices = autocomp(cog, inter, user_input)
         else:
-            choices = autocomp(inter, user_input)
+            choices = autocomp(inter, user_input)  # type: ignore
 
     if inspect.isawaitable(choices):
         return await choices
@@ -278,7 +297,9 @@ class SubCommand(InvokableApplicationCommand):
         super().__init__(func, name=name_loc.string, **kwargs)
         self.parent: Union[InvokableSlashCommand, SubCommandGroup] = parent
         self.connectors: Dict[str, str] = connectors or {}
-        self.autocompleters: Dict[str, Any] = kwargs.get("autocompleters", {})
+        self.autocompleters: Dict[str, Union[_AnyAutocompleteCallback, Choices]] = kwargs.get(
+            "autocompleters", {}
+        )
 
         if options is None:
             options = expand_params(self)
@@ -369,7 +390,9 @@ class SubCommand(InvokableApplicationCommand):
 
             await self.call_after_hooks(inter)
 
-    def autocomplete(self, option_name: str) -> Callable[[Callable], Callable]:
+    def autocomplete(
+        self, option_name: str
+    ) -> Callable[[_AutocompleteCallbackT], _AutocompleteCallbackT]:
         """A decorator that registers an autocomplete function for the specified option.
 
         Parameters
@@ -378,6 +401,27 @@ class SubCommand(InvokableApplicationCommand):
             The name of the slash command option.
         """
         return _autocomplete(self, option_name)
+
+    def add_autocompleter(
+        self,
+        option_name: str,
+        /,
+        autocompleter: Union[_AutocompleteCallback, Choices],
+    ) -> None:
+        """Register an autocompleter for the specified option.
+
+        Parameters
+        ----------
+        option_name: :class:`str`
+            The name of the slash command option.
+        autocompleter: Union[Callable[..., Choices], Choices]
+            Either an autocomplete function that dynamically returns choices based on user input,
+            or a static list or dict of choices.
+        """
+        if callable(autocompleter):
+            _register_autocompleter(self, option_name, autocompleter)
+        else:
+            self.autocompleters[option_name] = autocompleter
 
 
 class InvokableSlashCommand(InvokableApplicationCommand):
@@ -448,7 +492,9 @@ class InvokableSlashCommand(InvokableApplicationCommand):
         self.children: Dict[str, Union[SubCommand, SubCommandGroup]] = {}
         self.auto_sync: bool = True if auto_sync is None else auto_sync
         self.guild_ids: Optional[Tuple[int, ...]] = None if guild_ids is None else tuple(guild_ids)
-        self.autocompleters: Dict[str, Any] = kwargs.get("autocompleters", {})
+        self.autocompleters: Dict[str, Union[_AnyAutocompleteCallback, Choices]] = kwargs.get(
+            "autocompleters", {}
+        )
 
         if options is None:
             options = expand_params(self)
@@ -622,8 +668,8 @@ class InvokableSlashCommand(InvokableApplicationCommand):
                 extras=extras,
                 **kwargs,
             )
-            self.children[new_func.name] = new_func
             self.body.options.append(new_func.option)
+            self.children[new_func.name] = new_func
             return new_func
 
         return decorator
@@ -637,6 +683,27 @@ class InvokableSlashCommand(InvokableApplicationCommand):
             The name of the slash command option.
         """
         return _autocomplete(self, option_name)
+
+    def add_autocompleter(
+        self,
+        option_name: str,
+        /,
+        autocompleter: Union[_AutocompleteCallback, Choices],
+    ) -> None:
+        """Register an autocompleter for the specified option.
+
+        Parameters
+        ----------
+        option_name: :class:`str`
+            The name of the slash command option.
+        autocompleter: Union[Callable[..., Choices], Choices]
+            Either an autocomplete function that dynamically returns choices based on user input,
+            or a static list or dict of choices.
+        """
+        if callable(autocompleter):
+            _register_autocompleter(self, option_name, autocompleter)
+        else:
+            self.autocompleters[option_name] = autocompleter
 
     async def _call_external_error_handlers(
         self, inter: ApplicationCommandInteraction, error: CommandError
